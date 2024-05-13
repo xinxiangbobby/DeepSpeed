@@ -18,6 +18,7 @@ from .fp16.loss_scaler import (
     INITIAL_LOSS_SCALE,
     SCALE_WINDOW,
     DELAYED_SHIFT,
+    CONSECUTIVE_HYSTERESIS,
     MIN_LOSS_SCALE,
 )
 from .config_utils import (
@@ -29,6 +30,8 @@ from .zero.config import get_zero_config, ZeroStageEnum
 from .activation_checkpointing.config import DeepSpeedActivationCheckpointingConfig
 from ..comm.config import DeepSpeedCommsConfig
 from ..monitor.config import get_monitor_config
+from ..inference.config import WeightQuantConfig
+from .compiler import get_compile_config
 
 from deepspeed import comm as dist
 from deepspeed.runtime.config_utils import DeepSpeedConfigModel
@@ -46,8 +49,8 @@ from ..elasticity.constants import (
     ELASTICITY,
     IGNORE_NON_ELASTIC_BATCH_INFO,
     IGNORE_NON_ELASTIC_BATCH_INFO_DEFAULT,
-    MODEL_PARLLEL_SIZE,
-    MODEL_PARLLEL_SIZE_DEFAULT,
+    MODEL_PARALLEL_SIZE,
+    MODEL_PARALLEL_SIZE_DEFAULT,
     NUM_GPUS_PER_NODE,
     NUM_GPUS_PER_NODE_DEFAULT,
 )
@@ -72,9 +75,13 @@ LAMB_OPTIMIZER = 'lamb'
 ONEBIT_ADAM_OPTIMIZER = 'onebitadam'
 ZERO_ONE_ADAM_OPTIMIZER = 'zerooneadam'
 ONEBIT_LAMB_OPTIMIZER = 'onebitlamb'
+MUADAM_OPTIMIZER = 'muadam'
+MUADAMW_OPTIMIZER = 'muadamw'
+MUSGD_OPTIMIZER = 'musgd'
+LION_OPTIMIZER = 'lion'
 DEEPSPEED_OPTIMIZERS = [
     ADAGRAD_OPTIMIZER, ADAM_OPTIMIZER, ADAMW_OPTIMIZER, LAMB_OPTIMIZER, ONEBIT_ADAM_OPTIMIZER, ONEBIT_LAMB_OPTIMIZER,
-    ZERO_ONE_ADAM_OPTIMIZER
+    ZERO_ONE_ADAM_OPTIMIZER, MUADAM_OPTIMIZER, MUADAMW_OPTIMIZER, MUSGD_OPTIMIZER, LION_OPTIMIZER
 ]
 
 # extra optimizer parameters for adam/adamw
@@ -162,6 +169,14 @@ def get_bfloat16_enabled(param_dict):
     return False
 
 
+def get_bfloat16_immediate_grad_update(param_dict):
+    for key in [BFLOAT16, BFLOAT16_OLD]:
+        if key in param_dict.keys():
+            return get_scalar_param(param_dict[key], BFLOAT16_IMMEDIATE_GRAD_UPDATE,
+                                    BFLOAT16_IMMEDIATE_GRAD_UPDATE_DEFAULT)
+    return False
+
+
 def get_fp16_master_weights_and_grads_enabled(param_dict):
     if get_fp16_enabled(param_dict):
         return get_scalar_param(param_dict[FP16], FP16_MASTER_WEIGHTS_AND_GRADS, FP16_MASTER_WEIGHTS_AND_GRADS_DEFAULT)
@@ -204,16 +219,20 @@ def get_dynamic_loss_scale_args(param_dict):
             FP16_LOSS_SCALE_WINDOW,
             FP16_MIN_LOSS_SCALE,
             FP16_HYSTERESIS,
+            FP16_CONSECUTIVE_HYSTERESIS,
         ]
         if any(arg in list(fp16_dict.keys()) for arg in dynamic_loss_args):
             init_scale = get_scalar_param(fp16_dict, FP16_INITIAL_SCALE_POWER, FP16_INITIAL_SCALE_POWER_DEFAULT)
             scale_window = get_scalar_param(fp16_dict, FP16_LOSS_SCALE_WINDOW, FP16_LOSS_SCALE_WINDOW_DEFAULT)
             delayed_shift = get_scalar_param(fp16_dict, FP16_HYSTERESIS, FP16_HYSTERESIS_DEFAULT)
+            consecutive_hysteresis = get_scalar_param(fp16_dict, FP16_CONSECUTIVE_HYSTERESIS,
+                                                      FP16_CONSECUTIVE_HYSTERESIS_DEFAULT)
             min_loss_scale = get_scalar_param(fp16_dict, FP16_MIN_LOSS_SCALE, FP16_MIN_LOSS_SCALE_DEFAULT)
             loss_scale_args = {
                 INITIAL_LOSS_SCALE: 2**init_scale,
                 SCALE_WINDOW: scale_window,
                 DELAYED_SHIFT: delayed_shift,
+                CONSECUTIVE_HYSTERESIS: consecutive_hysteresis,
                 MIN_LOSS_SCALE: min_loss_scale,
             }
 
@@ -228,8 +247,10 @@ def get_sparse_gradients_enabled(param_dict):
     return get_scalar_param(param_dict, SPARSE_GRADIENTS, SPARSE_GRADIENTS_DEFAULT)
 
 
-def get_communication_data_type(param_dict):
-    val = get_scalar_param(param_dict, COMMUNICATION_DATA_TYPE, COMMUNICATION_DATA_TYPE_DEFAULT)
+def get_communication_data_type(param_dict,
+                                comm_type=COMMUNICATION_DATA_TYPE,
+                                comm_data_type_default=COMMUNICATION_DATA_TYPE_DEFAULT):
+    val = get_scalar_param(param_dict, comm_type, comm_data_type_default)
     val = val.lower() if val is not None else val
     if val is None:
         return val  # we must determine it by other parameters
@@ -237,10 +258,10 @@ def get_communication_data_type(param_dict):
         return torch.float32
     elif val == "fp16":
         return torch.float16
-    elif val == "bfp16":
+    elif val == "bf16":
         return torch.bfloat16
 
-    raise ValueError(f"Invalid communication_data_type. Supported data types: ['fp16', 'bfp16', 'fp32']. Got: {val}")
+    raise ValueError(f"Invalid communication_data_type. Supported data types: ['fp16', 'bf16', 'fp32']. Got: {val}")
 
 
 def get_prescale_gradients(param_dict):
@@ -265,6 +286,10 @@ def get_dump_state(param_dict):
 
 def get_gradient_clipping(param_dict):
     return get_scalar_param(param_dict, GRADIENT_CLIPPING, GRADIENT_CLIPPING_DEFAULT)
+
+
+def get_graph_harvesting(param_dict):
+    return get_scalar_param(param_dict, GRAPH_HARVESTING, GRAPH_HARVESTING_DEFAULT)
 
 
 def get_sparse_attention(param_dict):
@@ -437,6 +462,8 @@ def get_pipeline_config(param_dict):
         "partition": "best",
         "seed_layers": False,
         "activation_checkpoint_interval": 0,
+        "pipe_partitioned": True,
+        "grad_partitioned": True,
     }
     config = default_pipeline
     for key, val in param_dict.get("pipeline", {}).items():
@@ -528,6 +555,10 @@ def get_hybrid_engine_config(param_dict):
     hybrid_engine_config_dict = param_dict.get("hybrid_engine", {})
     hybrid_engine_config = HybridEngineConfig(**hybrid_engine_config_dict)
     return hybrid_engine_config
+
+
+def get_expert_data_topo_config(param_dict):
+    return get_scalar_param(param_dict, USE_DATA_BEFORE_EXPERT_PARALLEL, USE_DATA_BEFORE_EXPERT_PARALLEL_DEFAULT)
 
 
 def get_eigenvalue_config(param_dict):
@@ -712,7 +743,7 @@ class DeepSpeedConfig(object):
             # Ensure the resource scheduler saw the same elastic config we are using at runtime
             ensure_immutable_elastic_config(runtime_elastic_config_dict=elastic_dict)
 
-            self.elastic_model_parallel_size = elastic_dict.get(MODEL_PARLLEL_SIZE, MODEL_PARLLEL_SIZE_DEFAULT)
+            self.elastic_model_parallel_size = elastic_dict.get(MODEL_PARALLEL_SIZE, MODEL_PARALLEL_SIZE_DEFAULT)
             if self.elastic_model_parallel_size < 1:
                 raise ElasticityConfigError("Model-Parallel size cannot be less than 1, "
                                             f"given model-parallel size: {self.elastic_model_parallel_size}")
@@ -774,11 +805,15 @@ class DeepSpeedConfig(object):
 
         self.disable_allgather = get_disable_allgather(param_dict)
         self.communication_data_type = get_communication_data_type(param_dict)
+        self.seq_parallel_communication_data_type = get_communication_data_type(
+            param_dict, SEQ_PARALLEL_COMMUNICATION_DATA_TYPE, SEQ_PARALLEL_COMMUNICATION_DATA_TYPE_DEFAULT)
         self.prescale_gradients = get_prescale_gradients(param_dict)
         self.gradient_predivide_factor = get_gradient_predivide_factor(param_dict)
         self.sparse_gradients_enabled = get_sparse_gradients_enabled(param_dict)
 
         self.zero_config = get_zero_config(param_dict)
+        self.mics_shard_size = self.zero_config.mics_shard_size
+        self.mics_hierarchial_params_gather = self.zero_config.mics_hierarchical_params_gather
         self.zero_optimization_stage = self.zero_config.stage
         self.zero_enabled = self.zero_optimization_stage > 0
 
@@ -791,6 +826,7 @@ class DeepSpeedConfig(object):
         self.fp16_enabled = get_fp16_enabled(param_dict)
         self.fp16_auto_cast = get_fp16_auto_cast(param_dict)
         self.bfloat16_enabled = get_bfloat16_enabled(param_dict)
+        self.bfloat16_immediate_grad_update = get_bfloat16_immediate_grad_update(param_dict)
         assert not (self.fp16_enabled
                     and self.bfloat16_enabled), 'bfloat16 and fp16 modes cannot be simultaneously enabled'
         self.fp16_master_weights_and_gradients = get_fp16_master_weights_and_grads_enabled(param_dict)
@@ -801,6 +837,7 @@ class DeepSpeedConfig(object):
         self.dynamic_loss_scale_args = get_dynamic_loss_scale_args(param_dict)
 
         self.compression_config = get_compression_config(param_dict)
+        self.graph_harvesting = get_graph_harvesting(param_dict)
 
         self.optimizer_name = get_optimizer_name(param_dict)
         if (self.optimizer_name is not None and self.optimizer_name.lower() in DEEPSPEED_OPTIMIZERS):
@@ -832,6 +869,7 @@ class DeepSpeedConfig(object):
             self.eigenvalue_layer_num,
         ) = get_eigenvalue_config(param_dict)
 
+        self.use_data_before_expert_parallel_ = get_expert_data_topo_config(param_dict)
         self.hybrid_engine = get_hybrid_engine_config(param_dict)
 
         self.sparse_attention = get_sparse_attention(param_dict)
@@ -867,6 +905,11 @@ class DeepSpeedConfig(object):
         self.dataloader_drop_last = get_dataloader_drop_last(param_dict)
 
         self.nebula_config = DeepSpeedNebulaConfig(param_dict)
+
+        self.weight_quantization_config = WeightQuantConfig(
+            **param_dict['weight_quantization']) if 'weight_quantization' in param_dict else None
+
+        self.compile_config = get_compile_config(param_dict)
 
     def _batch_assertion(self):
 
